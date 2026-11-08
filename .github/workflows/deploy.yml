@@ -22,23 +22,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Kode
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Siapkan Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
+      - name: Siapkan Bun (Sesuai Google AI Studio)
+        uses: oven-sh/setup-bun@v2
 
       - name: Install & Build React
         run: |
-          npm install
-          npx vite build --base=./
+          bun install
+          bun x vite build --base=./
 
       - name: Konfigurasi GitHub Pages
         uses: actions/configure-pages@v5
 
       - name: Upload Hasil Build
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v4
         with:
           path: ./dist
 
