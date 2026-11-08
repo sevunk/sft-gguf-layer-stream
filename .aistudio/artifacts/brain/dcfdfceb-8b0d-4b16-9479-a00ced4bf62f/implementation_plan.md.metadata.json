@@ -1,0 +1,6 @@
+{
+  "summary":  "Implementation plan for Model Inspector & Layer Extractor (Safetensors & GGUF) preserving 100% of the binary stream parsing logic, adding a bilingual ID/EN header toggle, optional CORS proxy fallback for remote HTTP Range requests, and GitHub Pages configuration.",
+  "updatedAt":  "2026-11-08T12:57:59.697856336Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

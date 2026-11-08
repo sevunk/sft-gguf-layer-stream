@@ -1,0 +1,1817 @@
+import React, { useState, useMemo, useRef } from 'react';
+import {
+  Search, Download, Copy, Check, Upload, Globe, Cpu, Layers,
+  Database, FileJson, Sun, Moon, AlertCircle, Sparkles,
+  HardDrive, Key, Settings2, ChevronLeft, ChevronRight, SlidersHorizontal, Languages, ShieldAlert, BarChart3
+} from 'lucide-react';
+import {
+  ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Cell
+} from 'recharts';
+
+// ============================================================================
+// 📋 TABEL SPESIFIKASI RESMI GGUF & SAFETENSORS
+// ============================================================================
+const GGML_TYPES: Record<number, string> = {
+  0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 4: "Q4_2", 5: "Q4_3",
+  6: "Q5_0", 7: "Q5_1", 8: "Q8_0", 9: "Q8_1", 10: "Q2_K", 11: "Q3_K",
+  12: "Q4_K", 13: "Q5_K", 14: "Q6_K", 15: "Q8_K", 16: "IQ2_XXS",
+  17: "IQ2_XS", 18: "IQ3_XXS", 19: "IQ1_S", 20: "IQ4_NL", 21: "IQ3_S",
+  22: "IQ2_S", 23: "IQ4_XS", 24: "I8", 25: "I16", 26: "I32", 27: "I64",
+  28: "F64", 29: "IQ1_M", 30: "BF16", 31: "Q4_0_4_4", 32: "Q4_0_4_8",
+  33: "Q4_0_8_8", 34: "TQ1_0", 35: "TQ2_0", 36: "IQ4_NL_4_4",
+  37: "IQ4_NL_4_8", 38: "IQ4_NL_8_8", 39: "MXFP4", 40: "NVFP4",
+};
+
+const GGUF_VAL_SIZES: Record<number, number> = {
+  0: 1, // UINT8
+  1: 1, // INT8
+  2: 2, // UINT16
+  3: 2, // INT16
+  4: 4, // UINT32
+  5: 4, // INT32
+  6: 4, // FLOAT32
+  7: 1, // BOOL
+  10: 8, // UINT64
+  11: 8, // INT64
+  12: 8, // FLOAT64
+};
+
+const QUANT_HELPER_SUFFIXES = [
+  ".weight_scale",
+  ".weight_scale_2",
+  ".input_scale",
+  ".scale_weight",
+  ".comfy_quant",
+  ".scaled_fp8",
+  ".comfy_attention.config",
+];
+
+// ============================================================================
+// 🧩 TIPE DATA TYPESCRIPT
+// ============================================================================
+interface TensorItem {
+  name: string;
+  shape: number[];
+  precision: string;
+  parameters: number;
+  blockGroup: string;
+}
+
+interface BlockGroupInfo {
+  total_blocks?: number;
+  total_tensors: number;
+  parameters: number;
+  parameters_M: number;
+}
+
+interface SummaryInfo {
+  file_name: string;
+  source_type: string;
+  format: string;
+  file_size_gb: number;
+  file_size_mb: number;
+  total_layers: number;
+  quantization_helper_tensors: number;
+  total_parameters: number;
+  total_parameters_billion: number;
+  downloaded_kb: number;
+  precision_distribution: Record<string, {
+    tensor_count: number;
+    parameters: number;
+    percentage_tensors: number;
+  }>;
+  architecture_block_summary: Record<string, BlockGroupInfo>;
+}
+
+type JsonStructureMode = 'lengkap' | 'ringkas' | 'minimal';
+type LangMode = 'id' | 'en';
+
+// ============================================================================
+// 🌐 HYBRID STREAM READER (MENDUKUNG FILE LOKAL & HTTP RANGE HUGGING FACE)
+// ============================================================================
+class HybridBrowserReader {
+  private sourceType: 'local' | 'remote';
+  private file?: File;
+  private url?: string;
+  private headers: Record<string, string>;
+  private useCorsFallback: boolean;
+  public totalBytes: number;
+  public bytesDownloaded = 0;
+
+  private buffer = new Uint8Array(0);
+  private pos = 0;
+  private remoteOffset = 0;
+  private chunkSize = 2 * 1024 * 1024; // 2 MB chunk
+
+  constructor(opts: {
+    sourceType: 'local' | 'remote';
+    file?: File;
+    url?: string;
+    headers?: Record<string, string>;
+    totalBytes?: number;
+    useCorsFallback?: boolean;
+  }) {
+    this.sourceType = opts.sourceType;
+    this.file = opts.file;
+    this.url = opts.url;
+    this.headers = opts.headers || {};
+    this.totalBytes = opts.totalBytes || (opts.file ? opts.file.size : 0);
+    this.useCorsFallback = Boolean(opts.useCorsFallback);
+  }
+
+  private async fetchRangeWithOptionalFallback(targetUrl: string, rangeHeader: string): Promise<Response> {
+    try {
+      const resp = await fetch(targetUrl, {
+        headers: {
+          ...this.headers,
+          Range: rangeHeader,
+        },
+      });
+      if (resp.status === 200 || resp.status === 206) {
+        return resp;
+      }
+      if (!this.useCorsFallback) {
+        return resp;
+      }
+    } catch (err) {
+      if (!this.useCorsFallback) {
+        throw err;
+      }
+    }
+
+    // Fallback via CORS proxy if enabled and direct fetch fails/blocks
+    const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`;
+    return await fetch(proxyUrl, {
+      headers: {
+        ...this.headers,
+        Range: rangeHeader,
+      },
+    });
+  }
+
+  private async ensureBytes(n: number): Promise<void> {
+    const available = this.buffer.length - this.pos;
+    if (available >= n) return;
+
+    const needed = n - available;
+    const fetchSize = Math.max(this.chunkSize, needed);
+
+    if (this.sourceType === 'local' && this.file) {
+      const endByte = Math.min(this.remoteOffset + fetchSize, this.file.size);
+      const slice = this.file.slice(this.remoteOffset, endByte);
+      const arrayBuf = await slice.arrayBuffer();
+      const chunk = new Uint8Array(arrayBuf);
+      this.appendChunk(chunk);
+    } else if (this.sourceType === 'remote' && this.url) {
+      const endByte = this.totalBytes > 0
+        ? Math.min(this.remoteOffset + fetchSize - 1, this.totalBytes - 1)
+        : this.remoteOffset + fetchSize - 1;
+
+      const rangeStr = `bytes=${this.remoteOffset}-${endByte}`;
+      const resp = await this.fetchRangeWithOptionalFallback(this.url, rangeStr);
+
+      if (resp.status !== 200 && resp.status !== 206) {
+        throw new Error(`Gagal membaca Range ${rangeStr} (HTTP ${resp.status})`);
+      }
+
+      const arrayBuf = await resp.arrayBuffer();
+      const chunk = new Uint8Array(arrayBuf);
+      this.appendChunk(chunk);
+    }
+
+    if (this.buffer.length - this.pos < n) {
+      throw new Error("File berakhir lebih awal saat membaca header metadata.");
+    }
+  }
+
+  private appendChunk(chunk: Uint8Array) {
+    const remaining = this.buffer.subarray(this.pos);
+    const merged = new Uint8Array(remaining.length + chunk.length);
+    merged.set(remaining, 0);
+    merged.set(chunk, remaining.length);
+    this.buffer = merged;
+    this.pos = 0;
+    this.remoteOffset += chunk.length;
+    this.bytesDownloaded += chunk.length;
+  }
+
+  async read(n: number): Promise<Uint8Array> {
+    if (n <= 0) return new Uint8Array(0);
+    await this.ensureBytes(n);
+    const slice = this.buffer.slice(this.pos, this.pos + n);
+    this.pos += n;
+    return slice;
+  }
+
+  async skip(n: number): Promise<void> {
+    if (n <= 0) return;
+    const available = this.buffer.length - this.pos;
+    if (n <= available) {
+      this.pos += n;
+    } else {
+      const leftover = n - available;
+      this.buffer = new Uint8Array(0);
+      this.pos = 0;
+      this.remoteOffset += leftover;
+    }
+  }
+
+  async readUint32(): Promise<number> {
+    const b = await this.read(4);
+    return new DataView(b.buffer, b.byteOffset, 4).getUint32(0, true);
+  }
+
+  async readInt32(): Promise<number> {
+    const b = await this.read(4);
+    return new DataView(b.buffer, b.byteOffset, 4).getInt32(0, true);
+  }
+
+  async readUint64(): Promise<number> {
+    const b = await this.read(8);
+    const val = new DataView(b.buffer, b.byteOffset, 8).getBigUint64(0, true);
+    return Number(val);
+  }
+
+  async readInt64(): Promise<number> {
+    const b = await this.read(8);
+    const val = new DataView(b.buffer, b.byteOffset, 8).getBigInt64(0, true);
+    return Number(val);
+  }
+
+  async readString(version = 3): Promise<string> {
+    const len = version === 1 ? await this.readUint32() : await this.readUint64();
+    const bytes = await this.read(len);
+    return new TextDecoder('utf-8').decode(bytes);
+  }
+
+  async readGgufScalar(vtype: number): Promise<any> {
+    const size = GGUF_VAL_SIZES[vtype];
+    if (!size) throw new Error(`Tipe scalar GGUF tidak dikenal: ${vtype}`);
+    const b = await this.read(size);
+    const dv = new DataView(b.buffer, b.byteOffset, size);
+    switch (vtype) {
+      case 0: return dv.getUint8(0);
+      case 1: return dv.getInt8(0);
+      case 2: return dv.getUint16(0, true);
+      case 3: return dv.getInt16(0, true);
+      case 4: return dv.getUint32(0, true);
+      case 5: return dv.getInt32(0, true);
+      case 6: return Number(dv.getFloat32(0, true).toFixed(6));
+      case 7: return dv.getUint8(0) !== 0;
+      case 10: return Number(dv.getBigUint64(0, true));
+      case 11: return Number(dv.getBigInt64(0, true));
+      case 12: return Number(dv.getFloat64(0, true).toFixed(6));
+      default: return null;
+    }
+  }
+}
+
+// ============================================================================
+// 🧠 FUNGSI ANALISIS ARSITEKTUR & PARSER
+// ============================================================================
+function calcNumel(shape: number[]): number {
+  if (!shape || shape.length === 0) return 1;
+  return shape.reduce((acc, v) => acc * Number(v), 1);
+}
+
+function getCleanBlockGroup(name: string): { groupKey: string; isIndexed: boolean; index?: number } {
+  let clean = name;
+  for (const pref of ["model.diffusion_model.", "diffusion_model.", "model."]) {
+    if (clean.startsWith(pref)) {
+      clean = clean.slice(pref.length);
+      break;
+    }
+  }
+  const parts = clean.split(".");
+  if (parts.length >= 2 && /^\d+$/.test(parts[1])) {
+    return { groupKey: parts[0], isIndexed: true, index: parseInt(parts[1], 10) };
+  }
+  if (parts.length >= 3 && /^\d+$/.test(parts[2])) {
+    return { groupKey: `${parts[0]}.${parts[1]}`, isIndexed: true, index: parseInt(parts[2], 10) };
+  }
+  const topPrefix = parts.length > 1 ? parts[0] : "(root)";
+  return { groupKey: topPrefix, isIndexed: false };
+}
+
+function analyzeArchitectureGroups(tensors: TensorItem[]): Record<string, BlockGroupInfo> {
+  const indexed: Record<string, { indices: Set<number>; tensorCount: number; paramCount: number }> = {};
+  const nonIndexed: Record<string, { tensorCount: number; paramCount: number }> = {};
+
+  for (const t of tensors) {
+    const info = getCleanBlockGroup(t.name);
+    if (info.isIndexed && info.index !== undefined) {
+      if (!indexed[info.groupKey]) {
+        indexed[info.groupKey] = { indices: new Set(), tensorCount: 0, paramCount: 0 };
+      }
+      indexed[info.groupKey].indices.add(info.index);
+      indexed[info.groupKey].tensorCount += 1;
+      indexed[info.groupKey].paramCount += t.parameters;
+    } else {
+      if (!nonIndexed[info.groupKey]) {
+        nonIndexed[info.groupKey] = { tensorCount: 0, paramCount: 0 };
+      }
+      nonIndexed[info.groupKey].tensorCount += 1;
+      nonIndexed[info.groupKey].paramCount += t.parameters;
+    }
+  }
+
+  const summary: Record<string, BlockGroupInfo> = {};
+
+  Object.keys(indexed).sort().forEach((grp) => {
+    const data = indexed[grp];
+    const sortedIdx = Array.from(data.indices).sort((a, b) => a - b);
+    const minI = sortedIdx[0];
+    const maxI = sortedIdx[sortedIdx.length - 1];
+    const label = `${grp}.[${minI}..${maxI}]`;
+    summary[label] = {
+      total_blocks: sortedIdx.length,
+      total_tensors: data.tensorCount,
+      parameters: data.paramCount,
+      parameters_M: Number((data.paramCount / 1e6).toFixed(2)),
+    };
+  });
+
+  Object.keys(nonIndexed).sort().forEach((grp) => {
+    const data = nonIndexed[grp];
+    summary[grp] = {
+      total_tensors: data.tensorCount,
+      parameters: data.paramCount,
+      parameters_M: Number((data.paramCount / 1e6).toFixed(2)),
+    };
+  });
+
+  return summary;
+}
+
+async function parseGgufStream(
+  reader: HybridBrowserReader,
+  summarizeArrays: boolean,
+  maxItems: number
+) {
+  const magicBytes = await reader.read(4);
+  const magic = new TextDecoder().decode(magicBytes);
+  if (magic !== "GGUF") {
+    throw new Error("File ini bukan format GGUF yang valid.");
+  }
+
+  const version = await reader.readUint32();
+  if (![1, 2, 3].includes(version)) {
+    throw new Error(`Versi GGUF tidak didukung: v${version}`);
+  }
+
+  const tensorCount = version === 1 ? await reader.readUint32() : await reader.readUint64();
+  const kvCount = version === 1 ? await reader.readUint32() : await reader.readUint64();
+
+  const readValue = async (vtype: number): Promise<any> => {
+    if (vtype in GGUF_VAL_SIZES) {
+      return await reader.readGgufScalar(vtype);
+    } else if (vtype === 8) {
+      return await reader.readString(version);
+    } else if (vtype === 9) {
+      const itemType = await reader.readUint32();
+      const arrLen = version === 1 ? await reader.readUint32() : await reader.readUint64();
+
+      if (summarizeArrays && arrLen > maxItems && itemType in GGUF_VAL_SIZES) {
+        const size = GGUF_VAL_SIZES[itemType];
+        const sample = [];
+        for (let i = 0; i < maxItems; i++) {
+          sample.push(await reader.readGgufScalar(itemType));
+        }
+        await reader.skip((arrLen - maxItems) * size);
+        return `<Array numerik (${arrLen.toLocaleString()} item), sampel: [${sample.slice(0, 5).join(", ")} ...]>`;
+      }
+
+      if (summarizeArrays && arrLen > maxItems) {
+        const sample = [];
+        for (let i = 0; i < maxItems; i++) {
+          sample.push(await readValue(itemType));
+        }
+        for (let i = 0; i < arrLen - maxItems; i++) {
+          await readValue(itemType);
+        }
+        return `<Array (${arrLen.toLocaleString()} item), sampel: [${sample.slice(0, 5).join(", ")} ...]>`;
+      }
+
+      const arr = [];
+      for (let i = 0; i < arrLen; i++) {
+        arr.push(await readValue(itemType));
+      }
+      return arr;
+    } else {
+      throw new Error(`Tipe value metadata GGUF tidak dikenal: ${vtype}`);
+    }
+  };
+
+  const metadata: Record<string, any> = { __gguf_version__: version };
+  for (let i = 0; i < kvCount; i++) {
+    const key = await reader.readString(version);
+    const vtype = await reader.readUint32();
+    metadata[key] = await readValue(vtype);
+  }
+
+  const tensorsList: TensorItem[] = [];
+  for (let i = 0; i < tensorCount; i++) {
+    const name = await reader.readString(version);
+    const nDims = await reader.readUint32();
+    const dims: number[] = [];
+    for (let d = 0; d < nDims; d++) {
+      dims.push(await reader.readUint64());
+    }
+    const ggmlTypeId = await reader.readUint32();
+    await reader.readUint64(); // offset
+
+    const precision = GGML_TYPES[ggmlTypeId] || `TYPE_${ggmlTypeId}`;
+    const numel = calcNumel(dims);
+    const grp = getCleanBlockGroup(name).groupKey;
+
+    tensorsList.push({
+      name,
+      shape: dims,
+      precision,
+      parameters: numel,
+      blockGroup: grp,
+    });
+  }
+
+  return {
+    formatName: `GGUF v${version}`,
+    metadata,
+    tensorsList,
+    quantHelperList: [] as TensorItem[],
+  };
+}
+
+async function parseSafetensorsStream(
+  reader: HybridBrowserReader,
+  separateQuantKeys: boolean
+) {
+  const headerSize = await reader.readUint64();
+  if (headerSize <= 0 || headerSize > 256 * 1024 * 1024) {
+    throw new Error(`Ukuran header Safetensors tidak wajar (${headerSize} bytes).`);
+  }
+
+  const rawJsonBytes = await reader.read(headerSize);
+  const jsonStr = new TextDecoder('utf-8').decode(rawJsonBytes).replace(/[\s\x00]+$/, '');
+  const headerJson = JSON.parse(jsonStr);
+
+  const rawMeta = headerJson.__metadata__ || {};
+  const metadata: Record<string, any> = {};
+  for (const [mk, mv] of Object.entries(rawMeta)) {
+    if (typeof mv === 'string' && (mv.trim().startsWith('{') || mv.trim().startsWith('['))) {
+      try {
+        metadata[mk] = JSON.parse(mv);
+      } catch {
+        metadata[mk] = mv;
+      }
+    } else {
+      metadata[mk] = mv;
+    }
+  }
+
+  const tensorsList: TensorItem[] = [];
+  const quantHelperList: TensorItem[] = [];
+
+  for (const [key, val] of Object.entries<any>(headerJson)) {
+    if (key === '__metadata__') continue;
+    const shape: number[] = val.shape || [];
+    const precision: string = val.dtype || 'UNKNOWN';
+    const parameters = calcNumel(shape);
+    const grp = getCleanBlockGroup(key).groupKey;
+
+    const entry: TensorItem = {
+      name: key,
+      shape,
+      precision,
+      parameters,
+      blockGroup: grp,
+    };
+
+    const isQuantHelper = QUANT_HELPER_SUFFIXES.some((suf) => key.endsWith(suf));
+    if (separateQuantKeys && isQuantHelper) {
+      quantHelperList.push(entry);
+    } else {
+      tensorsList.push(entry);
+    }
+  }
+
+  return {
+    formatName: 'Safetensors',
+    metadata,
+    tensorsList,
+    quantHelperList,
+  };
+}
+
+// ============================================================================
+// 🌍 KAMUS BAHASA INDONESIA & BAHASA INGGRIS (ID / EN)
+// ============================================================================
+const UI_TEXT = {
+  id: {
+    subtitle: 'Ekstrak daftar layer, ukuran shape, presisi, & metadata ke JSON tanpa mengunduh seluruh file model',
+    themeTooltip: 'Ganti Mode Tampilan (Dark / Light)',
+    langTooltip: 'Ganti Bahasa (Indonesia / English)',
+    sourceTitle: '1. Sumber Model',
+    tabHf: 'Link Hugging Face',
+    tabLocal: 'File Lokal (0 Kuota)',
+    hfUrlLabel: 'URL Hugging Face (`/blob/`, `/resolve/`, atau `user/repo/file`)',
+    hfTokenLabel: 'HF Token (Opsional — Hanya untuk repo Private / Gated)',
+    corsFallbackLabel: 'Gunakan CORS Proxy Fallback (Aktifkan jika URL terblokir CORS di browser)',
+    fileSizeInfo: (sizeGb: string) =>
+      `Ukuran File: ${sizeGb} GiB — Hanya beberapa KB pertama yang akan dibaca langsung dari disk!`,
+    dropPromptMain: 'Klik atau Drag & Drop file',
+    dropPromptSuffix: 'ke sini',
+    dropPromptSub: 'Instan tanpa upload! File 20 GB+ bisa dibaca dalam hitungan milidetik.',
+    extractBtnLoading: 'Mengekstrak Header Model...',
+    extractBtnIdle: 'Ekstrak Layer & Arsitektur',
+    settingsTitle: '2. Opsi Kerapian & Output JSON',
+    jsonModeLabel: 'Mode Struktur JSON',
+    jsonModeFull: 'Lengkap (Ringkasan + Metadata + Daftar Layer)',
+    jsonModeCompact: 'Ringkas (Hanya Ringkasan + Daftar Layer)',
+    jsonModeMinimal: 'Minimal (Map Nama Layer → Presisi & Shape)',
+    separateQuantTitle: 'Pisahkan Key Kuantisasi',
+    separateQuantDesc: 'dari daftar layer utama',
+    summarizeGgufTitle: 'Ringkas Array Besar GGUF',
+    summarizeGgufDesc: 'Lompati daftar token ribuan item di GGUF agar hemat kuota & cepat',
+    maxArrayItemsLabel: 'Batas Maks Item Array:',
+    errorTitle: 'Terjadi Kesalahan Ekstraksi',
+    errNoLocalFile: 'Silakan pilih atau Drag & Drop file .safetensors / .gguf terlebih dahulu!',
+    errEmptyUrl: 'Kolom Link Hugging Face tidak boleh kosong!',
+    errInvalidUrl: (raw: string) => `Format URL/Repo tidak valid: ${raw}`,
+    errAccessDenied: (status: number) =>
+      `Akses ditolak (HTTP ${status}). Pastikan HF_TOKEN diisi jika repo berstatus Private/Gated.`,
+    errFetchUrl: (status: number, url: string) => `Gagal mengakses URL (HTTP ${status}): ${url}`,
+    quotaReadPrefix: 'Kuota / Data Terbaca:',
+    quotaReadOnly: (kb: string) => `Hanya ${kb} KB`,
+    quotaReadFrom: (gb: number, mb: string) => `dari total ${gb} GiB (${mb} MB)`,
+    copiedBtn: 'JSON Tersalin!',
+    copyBtn: 'Copy JSON',
+    downloadBtn: 'Download .JSON',
+    statTotalParams: 'Total Parameter',
+    statMainLayers: 'Layer Utama',
+    statMainLayersSub: 'Tensor arsitektur',
+    statQuantTensors: 'Tensor Kuantisasi',
+    statQuantTensorsSub: 'Scale / helper keys',
+    statFileSize: 'Ukuran File Asli',
+    viewTabSummary: '🏗️ Ringkasan & Blok Arsitektur',
+    viewTabVisual: '📊 Visualisasi',
+    viewTabLayers: (count: string) => `🧩 Daftar Layer Utama (${count})`,
+    viewTabQuant: (count: string) => `⚖️ Tensor Kuantisasi (${count})`,
+    viewTabMeta: (count: number) => `📋 Metadata (${count})`,
+    viewTabJson: '📄 Preview Raw JSON',
+    visualTitle: 'Distribusi Parameter Berdasarkan Kelompok Blok Arsitektur',
+    visualSubtitle: 'Diagram batang jumlah parameter (dalam Juta / M) untuk setiap kelompok blok arsitektur yang terdeteksi',
+    precDistTitle: 'Distribusi Presisi (Dtype)',
+    millionParams: 'Juta params',
+    archBlockTitle: 'Kelompok Blok Arsitektur (Auto-Detected)',
+    colBlockGroup: 'Kelompok Blok',
+    colBlockCount: 'Jumlah Blok',
+    colTotalTensors: 'Total Tensor',
+    colParamsM: 'Parameter (Juta)',
+    blockUnit: 'Blok',
+    searchPlaceholderRegex: 'Cari dengan Regex (contoh: blocks\\.(0|1)\\.attn)...',
+    searchPlaceholderText: 'Cari nama layer (contoh: double_blocks, attn, lora)...',
+    regexTooltip: 'Aktifkan pencarian Regular Expression (Regex)',
+    allPrecisions: 'Semua Presisi (Dtype)',
+    precisionPrefix: 'Presisi',
+    allBlockGroups: 'Semua Kelompok Blok',
+    blockPrefix: 'Blok',
+    sortDefault: 'Urutan: Asli File',
+    sortName: 'Urutan: Nama (A-Z)',
+    sortParamsDesc: 'Parameter: Terbesar',
+    sortParamsAsc: 'Parameter: Terkecil',
+    showingCount: (filtered: string, total: string) =>
+      `Menampilkan ${filtered} dari ${total} layer`,
+    rowsPerPageLabel: 'Baris per halaman:',
+    colNo: 'No',
+    colLayerName: 'Nama Layer',
+    colShape: 'Shape',
+    colPrecision: 'Presisi',
+    colParameters: 'Parameter',
+    pageInfo: (curr: number, total: number) => `Halaman ${curr} dari ${total}`,
+    emptyQuantMsg: 'Tidak ada tensor bantu kuantisasi (.weight_scale, .comfy_quant, dll.) yang dipisahkan pada model ini.',
+    colQuantName: 'Nama Tensor Kuantisasi',
+    metaSearchPlaceholder: 'Cari key metadata...',
+    emptyMetaMsg: 'Tidak ada metadata pada header file ini.',
+    jsonPreviewHeader: 'Preview Struktur Output JSON (Maks 200 baris pertama ditampilkan agar browser ringan)',
+    jsonPreviewFooter: '// ... (Gunakan tombol Download .JSON atau Copy JSON di atas untuk mengambil seluruh isi file)',
+  },
+  en: {
+    subtitle: 'Extract layer lists, tensor shapes, precision dtypes, & metadata to JSON without downloading the full model file',
+    themeTooltip: 'Toggle Display Mode (Dark / Light)',
+    langTooltip: 'Switch Language (Indonesian / English)',
+    sourceTitle: '1. Model Source',
+    tabHf: 'Hugging Face Link',
+    tabLocal: 'Local File (0 Quota)',
+    hfUrlLabel: 'Hugging Face URL (`/blob/`, `/resolve/`, or `user/repo/file`)',
+    hfTokenLabel: 'HF Token (Optional — Only for Private / Gated repos)',
+    corsFallbackLabel: 'Use CORS Proxy Fallback (Enable if direct browser Range fetch is blocked by CORS)',
+    fileSizeInfo: (sizeGb: string) =>
+      `File Size: ${sizeGb} GiB — Only the first few KB will be read directly from disk!`,
+    dropPromptMain: 'Click or Drag & Drop a',
+    dropPromptSuffix: 'file here',
+    dropPromptSub: 'Instant with zero upload! 20 GB+ files are inspected in milliseconds.',
+    extractBtnLoading: 'Extracting Model Header...',
+    extractBtnIdle: 'Extract Layers & Architecture',
+    settingsTitle: '2. Formatting & JSON Output Options',
+    jsonModeLabel: 'JSON Structure Mode',
+    jsonModeFull: 'Lengkap / Full (Summary + Metadata + Layer List)',
+    jsonModeCompact: 'Ringkas / Compact (Summary + Layer List Only)',
+    jsonModeMinimal: 'Minimal (Map Layer Name → Precision & Shape)',
+    separateQuantTitle: 'Separate Quantization Keys',
+    separateQuantDesc: 'from the main layer list',
+    summarizeGgufTitle: 'Summarize Large GGUF Arrays',
+    summarizeGgufDesc: 'Skip multi-thousand token arrays in GGUF to save bandwidth & time',
+    maxArrayItemsLabel: 'Max Array Items Limit:',
+    errorTitle: 'Extraction Error Occurred',
+    errNoLocalFile: 'Please select or Drag & Drop a .safetensors / .gguf file first!',
+    errEmptyUrl: 'Hugging Face Link field cannot be empty!',
+    errInvalidUrl: (raw: string) => `Invalid URL/Repo format: ${raw}`,
+    errAccessDenied: (status: number) =>
+      `Access denied (HTTP ${status}). Make sure HF_TOKEN is provided if the repository is Private/Gated.`,
+    errFetchUrl: (status: number, url: string) => `Failed to access URL (HTTP ${status}): ${url}`,
+    quotaReadPrefix: 'Quota / Data Read:',
+    quotaReadOnly: (kb: string) => `Only ${kb} KB`,
+    quotaReadFrom: (gb: number, mb: string) => `out of ${gb} GiB (${mb} MB) total`,
+    copiedBtn: 'JSON Copied!',
+    copyBtn: 'Copy JSON',
+    downloadBtn: 'Download .JSON',
+    statTotalParams: 'Total Parameters',
+    statMainLayers: 'Main Layers',
+    statMainLayersSub: 'Architecture tensors',
+    statQuantTensors: 'Quantization Tensors',
+    statQuantTensorsSub: 'Scale / helper keys',
+    statFileSize: 'Original File Size',
+    viewTabSummary: '🏗️ Summary & Architecture Blocks',
+    viewTabVisual: '📊 Visualisasi',
+    viewTabLayers: (count: string) => `🧩 Main Layers List (${count})`,
+    viewTabQuant: (count: string) => `⚖️ Quantization Tensors (${count})`,
+    viewTabMeta: (count: number) => `📋 Metadata (${count})`,
+    viewTabJson: '📄 Preview Raw JSON',
+    visualTitle: 'Parameter Distribution by Architecture Block Group',
+    visualSubtitle: 'Bar chart of parameter counts (in Millions / M) across each detected architecture block group',
+    precDistTitle: 'Precision Distribution (Dtype)',
+    millionParams: 'Million params',
+    archBlockTitle: 'Architecture Block Groups (Auto-Detected)',
+    colBlockGroup: 'Block Group',
+    colBlockCount: 'Block Count',
+    colTotalTensors: 'Total Tensors',
+    colParamsM: 'Parameters (Million)',
+    blockUnit: 'Blocks',
+    searchPlaceholderRegex: 'Search with Regex (e.g., blocks\\.(0|1)\\.attn)...',
+    searchPlaceholderText: 'Search layer name (e.g., double_blocks, attn, lora)...',
+    regexTooltip: 'Enable Regular Expression (Regex) search',
+    allPrecisions: 'All Precisions (Dtype)',
+    precisionPrefix: 'Precision',
+    allBlockGroups: 'All Block Groups',
+    blockPrefix: 'Block',
+    sortDefault: 'Sort: File Order',
+    sortName: 'Sort: Name (A-Z)',
+    sortParamsDesc: 'Parameters: Largest',
+    sortParamsAsc: 'Parameters: Smallest',
+    showingCount: (filtered: string, total: string) =>
+      `Showing ${filtered} of ${total} layers`,
+    rowsPerPageLabel: 'Rows per page:',
+    colNo: 'No',
+    colLayerName: 'Layer Name',
+    colShape: 'Shape',
+    colPrecision: 'Precision',
+    colParameters: 'Parameters',
+    pageInfo: (curr: number, total: number) => `Page ${curr} of ${total}`,
+    emptyQuantMsg: 'No quantization helper tensors (.weight_scale, .comfy_quant, etc.) were separated in this model.',
+    colQuantName: 'Quantization Tensor Name',
+    metaSearchPlaceholder: 'Search metadata keys...',
+    emptyMetaMsg: 'No metadata found in this file header.',
+    jsonPreviewHeader: 'JSON Output Structure Preview (First 200 lines shown to keep browser responsive)',
+    jsonPreviewFooter: '// ... (Use the Download .JSON or Copy JSON button above to get the full file content)',
+  },
+};
+
+// ============================================================================
+// 🎨 KOMPONEN UTAMA REACT UI
+// ============================================================================
+export default function App() {
+  // Tema (Dark / Light) & Bahasa (ID / EN)
+  const [isDark, setIsDark] = useState(true);
+  const [lang, setLang] = useState<LangMode>('id');
+  const t = UI_TEXT[lang];
+
+  // Input Sumber Model
+  const [sourceTab, setSourceTab] = useState<'url' | 'local'>('url');
+  const [modelUrl, setModelUrl] = useState(
+    'https://huggingface.co/Comfy-Org/Krea-2/blob/main/diffusion_models/krea2_raw_bf16.safetensors'
+  );
+  const [hfToken, setHfToken] = useState('');
+  const [useCorsFallback, setUseCorsFallback] = useState(false);
+  const [localFile, setLocalFile] = useState<File | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Opsi Pengaturan
+  const [jsonMode, setJsonMode] = useState<JsonStructureMode>('lengkap');
+  const [separateQuant, setSeparateQuant] = useState(true);
+  const [summarizeGguf, setSummarizeGguf] = useState(true);
+  const [maxArrayItems, setMaxArrayItems] = useState(20);
+
+  // Status Ekstraksi & Data Hasil
+  const [loading, setLoading] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [summary, setSummary] = useState<SummaryInfo | null>(null);
+  const [mainTensors, setMainTensors] = useState<TensorItem[]>([]);
+  const [quantTensors, setQuantTensors] = useState<TensorItem[]>([]);
+  const [metadata, setMetadata] = useState<Record<string, any>>({});
+
+  // Tab View & Filter Canggih
+  const [activeTab, setActiveTab] = useState<'summary' | 'visual' | 'layers' | 'quant' | 'metadata' | 'json'>('summary');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [useRegex, setUseRegex] = useState(false);
+  const [selectedPrecision, setSelectedPrecision] = useState<string>('ALL');
+  const [selectedBlockGroup, setSelectedBlockGroup] = useState<string>('ALL');
+  const [sortBy, setSortBy] = useState<'default' | 'name' | 'params_desc' | 'params_asc'>('default');
+  const [currentPage, setCurrentPage] = useState(1);
+  const [rowsPerPage, setRowsPerPage] = useState(50);
+  const [metaSearch, setMetaSearch] = useState('');
+  const [copied, setCopied] = useState(false);
+
+  // Data Diagram Batang untuk Tab Visualisasi
+  const blockChartData = useMemo(() => {
+    if (!summary) return [];
+    return Object.entries(summary.architecture_block_summary)
+      .map(([blockGroup, info]) => ({
+        blockGroup,
+        parameters_M: info.parameters_M,
+        parameters: info.parameters,
+        total_tensors: info.total_tensors,
+        total_blocks: info.total_blocks || 0,
+      }))
+      .sort((a, b) => b.parameters - a.parameters);
+  }, [summary]);
+
+  // Fungsi Normalisasi Link Hugging Face
+  const normalizeHfUrl = (rawInput: string): string => {
+    let raw = rawInput.trim();
+    if (!raw.startsWith('http://') && !raw.startsWith('https://')) {
+      const cleanShort = raw.startsWith('hf://') ? raw.slice(5) : raw;
+      const parts = cleanShort.split('/').filter(Boolean);
+      if (parts.length >= 3) {
+        raw = `https://huggingface.co/${parts[0]}/${parts[1]}/resolve/main/${parts.slice(2).join('/')}`;
+      } else {
+        throw new Error(t.errInvalidUrl(raw));
+      }
+    }
+    const noQuery = raw.split('?')[0];
+    return noQuery.replace(
+      /^(https?:\/\/huggingface\.co\/[^/]+\/[^/]+)\/blob\/([^/]+\/.+)$/,
+      '$1/resolve/$2'
+    );
+  };
+
+  // Fungsi Eksekusi Ekstraksi
+  const handleExtract = async () => {
+    setLoading(true);
+    setErrorMsg(null);
+
+    try {
+      let reader: HybridBrowserReader;
+      let fileName = '';
+      let sourceLabel = '';
+      let isGguf = false;
+
+      if (sourceTab === 'local') {
+        if (!localFile) {
+          throw new Error(t.errNoLocalFile);
+        }
+        fileName = localFile.name;
+        sourceLabel = 'FILE LOKAL (BROWSER SLICE)';
+        const first4 = new Uint8Array(await localFile.slice(0, 4).arrayBuffer());
+        const magic = new TextDecoder().decode(first4);
+        isGguf = magic === 'GGUF' || fileName.toLowerCase().endsWith('.gguf');
+
+        reader = new HybridBrowserReader({
+          sourceType: 'local',
+          file: localFile,
+          totalBytes: localFile.size,
+        });
+      } else {
+        if (!modelUrl.trim()) {
+          throw new Error(t.errEmptyUrl);
+        }
+        const cleanUrl = normalizeHfUrl(modelUrl);
+        fileName = decodeURIComponent(cleanUrl.split('/').pop() || 'model');
+        sourceLabel = 'HUGGING FACE STREAM';
+
+        const headers: Record<string, string> = {};
+        if (hfToken.trim()) {
+          headers['Authorization'] = `Bearer ${hfToken.trim()}`;
+        }
+
+        let probeResp: Response;
+        try {
+          probeResp = await fetch(cleanUrl, {
+            headers: { ...headers, Range: 'bytes=0-15' },
+          });
+        } catch (fetchErr) {
+          if (useCorsFallback) {
+            const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(cleanUrl)}`;
+            probeResp = await fetch(proxyUrl, {
+              headers: { ...headers, Range: 'bytes=0-15' },
+            });
+          } else {
+            throw fetchErr;
+          }
+        }
+
+        if (probeResp.status === 401 || probeResp.status === 403) {
+          throw new Error(t.errAccessDenied(probeResp.status));
+        }
+        if (probeResp.status !== 200 && probeResp.status !== 206) {
+          throw new Error(t.errFetchUrl(probeResp.status, cleanUrl));
+        }
+
+        const firstBytes = new Uint8Array(await probeResp.arrayBuffer());
+        const magic = new TextDecoder().decode(firstBytes.slice(0, 4));
+        isGguf = magic === 'GGUF' || fileName.toLowerCase().endsWith('.gguf');
+
+        let totalBytes = 0;
+        const contentRange = probeResp.headers.get('Content-Range') || '';
+        if (contentRange.includes('/')) {
+          totalBytes = parseInt(contentRange.split('/').pop()!.trim(), 10) || 0;
+        } else {
+          totalBytes = parseInt(probeResp.headers.get('Content-Length') || '0', 10) || 0;
+        }
+
+        // Gunakan URL final setelah redirect jika ada
+        const targetUrl = probeResp.url && !probeResp.url.includes('corsproxy.io') ? probeResp.url : cleanUrl;
+        const sameOriginHost = new URL(targetUrl).hostname === new URL(cleanUrl).hostname;
+
+        reader = new HybridBrowserReader({
+          sourceType: 'remote',
+          url: targetUrl,
+          headers: sameOriginHost ? headers : {},
+          totalBytes,
+          useCorsFallback,
+        });
+      }
+
+      const parsed = isGguf
+        ? await parseGgufStream(reader, summarizeGguf, maxArrayItems)
+        : await parseSafetensorsStream(reader, separateQuant);
+
+      const downloadedKb = Number((reader.bytesDownloaded / 1024).toFixed(2));
+      const totalParams = parsed.tensorsList.reduce((acc, t) => acc + t.parameters, 0);
+
+      const precCounter: Record<string, { count: number; params: number }> = {};
+      for (const t of parsed.tensorsList) {
+        if (!precCounter[t.precision]) {
+          precCounter[t.precision] = { count: 0, params: 0 };
+        }
+        precCounter[t.precision].count += 1;
+        precCounter[t.precision].params += t.parameters;
+      }
+
+      const precisionDistribution: SummaryInfo['precision_distribution'] = {};
+      Object.entries(precCounter)
+        .sort((a, b) => b[1].count - a[1].count)
+        .forEach(([k, v]) => {
+          precisionDistribution[k] = {
+            tensor_count: v.count,
+            parameters: v.params,
+            percentage_tensors: Number(((v.count / Math.max(1, parsed.tensorsList.length)) * 100).toFixed(2)),
+          };
+        });
+
+      const archGroups = analyzeArchitectureGroups(parsed.tensorsList);
+
+      const summaryData: SummaryInfo = {
+        file_name: fileName,
+        source_type: sourceLabel,
+        format: parsed.formatName,
+        file_size_gb: reader.totalBytes ? Number((reader.totalBytes / 1024 ** 3).toFixed(4)) : 0,
+        file_size_mb: reader.totalBytes ? Number((reader.totalBytes / 1024 ** 2).toFixed(2)) : 0,
+        total_layers: parsed.tensorsList.length,
+        quantization_helper_tensors: parsed.quantHelperList.length,
+        total_parameters: totalParams,
+        total_parameters_billion: Number((totalParams / 1e9).toFixed(3)),
+        downloaded_kb: downloadedKb,
+        precision_distribution: precisionDistribution,
+        architecture_block_summary: archGroups,
+      };
+
+      setSummary(summaryData);
+      setMainTensors(parsed.tensorsList);
+      setQuantTensors(parsed.quantHelperList);
+      setMetadata(parsed.metadata);
+      setSelectedPrecision('ALL');
+      setSelectedBlockGroup('ALL');
+      setCurrentPage(1);
+    } catch (err: any) {
+      setErrorMsg(err?.message || String(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Menyusun Payload JSON sesuai Mode Struktur
+  const generatedJsonPayload = useMemo(() => {
+    if (!summary) return null;
+    const { downloaded_kb, ...cleanSummary } = summary;
+
+    if (jsonMode === 'minimal') {
+      const layersMap: Record<string, { precision: string; shape: number[] }> = {};
+      mainTensors.forEach((t) => {
+        layersMap[t.name] = { precision: t.precision, shape: t.shape };
+      });
+      return { summary: cleanSummary, layers: layersMap };
+    }
+
+    if (jsonMode === 'ringkas') {
+      return {
+        summary: cleanSummary,
+        tensors: mainTensors.map((t) => ({
+          name: t.name,
+          shape: `[${t.shape.join(', ')}]`,
+          precision: t.precision,
+        })),
+      };
+    }
+
+    const payload: Record<string, any> = {
+      summary: cleanSummary,
+      metadata,
+      tensors: mainTensors.map((t) => ({
+        name: t.name,
+        shape: `[${t.shape.join(', ')}]`,
+        precision: t.precision,
+      })),
+    };
+
+    if (quantTensors.length > 0) {
+      payload.quantization_helpers = quantTensors.map((t) => ({
+        name: t.name,
+        shape: `[${t.shape.join(', ')}]`,
+        precision: t.precision,
+      }));
+    }
+    return payload;
+  }, [summary, mainTensors, quantTensors, metadata, jsonMode]);
+
+  // Filter Canggih pada Daftar Layer
+  const filteredLayers = useMemo(() => {
+    let list = mainTensors;
+
+    if (selectedPrecision !== 'ALL') {
+      list = list.filter((t) => t.precision === selectedPrecision);
+    }
+
+    if (selectedBlockGroup !== 'ALL') {
+      list = list.filter((t) => t.blockGroup === selectedBlockGroup);
+    }
+
+    if (searchQuery.trim()) {
+      const q = searchQuery.trim();
+      if (useRegex) {
+        try {
+          const rx = new RegExp(q, 'i');
+          list = list.filter((t) => rx.test(t.name));
+        } catch {
+          // Abaikan jika regex belum lengkap diketik
+        }
+      } else {
+        const kw = q.toLowerCase();
+        list = list.filter((t) => t.name.toLowerCase().includes(kw));
+      }
+    }
+
+    if (sortBy === 'name') {
+      list = [...list].sort((a, b) => a.name.localeCompare(b.name));
+    } else if (sortBy === 'params_desc') {
+      list = [...list].sort((a, b) => b.parameters - a.parameters);
+    } else if (sortBy === 'params_asc') {
+      list = [...list].sort((a, b) => a.parameters - b.parameters);
+    }
+
+    return list;
+  }, [mainTensors, selectedPrecision, selectedBlockGroup, searchQuery, useRegex, sortBy]);
+
+  // Daftar Unik Group untuk Dropdown Filter
+  const uniqueBlockGroups = useMemo(() => {
+    const s = new Set<string>();
+    mainTensors.forEach((t) => s.add(t.blockGroup));
+    return Array.from(s).sort();
+  }, [mainTensors]);
+
+  // Pagination Layer
+  const totalPages = Math.max(1, Math.ceil(filteredLayers.length / rowsPerPage));
+  const paginatedLayers = useMemo(() => {
+    const start = (currentPage - 1) * rowsPerPage;
+    return filteredLayers.slice(start, start + rowsPerPage);
+  }, [filteredLayers, currentPage, rowsPerPage]);
+
+  // Download & Copy JSON
+  const handleDownloadJson = () => {
+    if (!generatedJsonPayload || !summary) return;
+    const baseName = summary.file_name.replace(/\.[^/.]+$/, '');
+    const outName = `${baseName}_layers.json`;
+    const blob = new Blob([JSON.stringify(generatedJsonPayload, null, 2)], {
+      type: 'application/json',
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = outName;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleCopyJson = async () => {
+    if (!generatedJsonPayload) return;
+    await navigator.clipboard.writeText(JSON.stringify(generatedJsonPayload, null, 2));
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  const BAR_COLORS = [
+    '#6366f1', '#10b981', '#8b5cf6', '#06b6d4',
+    '#f59e0b', '#ec4899', '#3b82f6', '#14b8a6'
+  ];
+
+  return (
+    <div className={`min-h-screen transition-colors duration-200 ${
+      isDark ? 'bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-900'
+    }`}>
+      {/* HEADER NAVBAR */}
+      <header className={`sticky top-0 z-30 border-b backdrop-blur-md ${
+        isDark ? 'bg-slate-900/80 border-slate-800' : 'bg-white/80 border-slate-200'
+      }`}>
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div className="p-2.5 rounded-xl bg-indigo-600 text-white shadow-lg shadow-indigo-500/30">
+              <Cpu className="w-6 h-6" />
+            </div>
+            <div>
+              <h1 className="text-lg sm:text-xl font-bold tracking-tight flex items-center gap-2 flex-wrap">
+                Model Inspector & Layer Extractor
+                <span className="text-xs px-2.5 py-0.5 rounded-full font-medium bg-indigo-500/15 text-indigo-400 border border-indigo-500/30">
+                  Safetensors & GGUF
+                </span>
+              </h1>
+              <p className={`text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+                {t.subtitle}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              onClick={() => setLang(lang === 'id' ? 'en' : 'id')}
+              className={`flex items-center gap-1.5 px-3 py-2 rounded-xl border text-xs font-semibold transition ${
+                isDark
+                  ? 'bg-slate-800 border-slate-700 text-indigo-400 hover:bg-slate-700'
+                  : 'bg-slate-100 border-slate-200 text-indigo-700 hover:bg-slate-200'
+              }`}
+              title={t.langTooltip}
+            >
+              <Languages className="w-4 h-4" />
+              <span>{lang === 'id' ? 'ID / EN' : 'EN / ID'}</span>
+            </button>
+
+            <button
+              onClick={() => setIsDark(!isDark)}
+              className={`flex items-center gap-2 px-3.5 py-2 rounded-xl border text-sm font-medium transition ${
+                isDark
+                  ? 'bg-slate-800 border-slate-700 text-amber-400 hover:bg-slate-700'
+                  : 'bg-slate-100 border-slate-200 text-slate-700 hover:bg-slate-200'
+              }`}
+              title={t.themeTooltip}
+            >
+              {isDark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+              <span className="hidden sm:inline">{isDark ? 'Light Mode' : 'Dark Mode'}</span>
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+        {/* PANEL INPUT & PENGATURAN */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          {/* KOLOM KIRI: SUMBER MODEL */}
+          <div className={`lg:col-span-2 rounded-2xl border p-5 shadow-sm ${
+            isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'
+          }`}>
+            <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
+              <h2 className="font-semibold flex items-center gap-2">
+                <Database className="w-4 h-4 text-indigo-500" />
+                {t.sourceTitle}
+              </h2>
+              <div className={`inline-flex rounded-xl p-1 border ${
+                isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-100 border-slate-200'
+              }`}>
+                <button
+                  onClick={() => setSourceTab('url')}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition ${
+                    sourceTab === 'url'
+                      ? 'bg-indigo-600 text-white shadow'
+                      : isDark ? 'text-slate-400 hover:text-white' : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <Globe className="w-3.5 h-3.5" /> {t.tabHf}
+                </button>
+                <button
+                  onClick={() => setSourceTab('local')}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition ${
+                    sourceTab === 'local'
+                      ? 'bg-indigo-600 text-white shadow'
+                      : isDark ? 'text-slate-400 hover:text-white' : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <HardDrive className="w-3.5 h-3.5" /> {t.tabLocal}
+                </button>
+              </div>
+            </div>
+
+            {sourceTab === 'url' ? (
+              <div className="space-y-4">
+                <div>
+                  <label className={`block text-xs font-medium mb-1.5 ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>
+                    {t.hfUrlLabel}
+                  </label>
+                  <input
+                    type="text"
+                    value={modelUrl}
+                    onChange={(e) => setModelUrl(e.target.value)}
+                    placeholder="https://huggingface.co/Comfy-Org/Krea-2/blob/main/diffusion_models/krea2_raw_bf16.safetensors"
+                    className={`w-full px-3.5 py-2.5 rounded-xl border text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500 ${
+                      isDark
+                        ? 'bg-slate-950 border-slate-800 text-slate-100'
+                        : 'bg-slate-50 border-slate-300 text-slate-900'
+                    }`}
+                  />
+                </div>
+                <div>
+                  <label className={`flex items-center gap-1.5 text-xs font-medium mb-1.5 ${isDark ? 'text-slate-400' : 'text-slate-600'}`}>
+                    <Key className="w-3.5 h-3.5" /> {t.hfTokenLabel}
+                  </label>
+                  <input
+                    type="password"
+                    value={hfToken}
+                    onChange={(e) => setHfToken(e.target.value)}
+                    placeholder="hf_..."
+                    className={`w-full px-3.5 py-2 rounded-xl border text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500 ${
+                      isDark
+                        ? 'bg-slate-950 border-slate-800 text-slate-100'
+                        : 'bg-slate-50 border-slate-300 text-slate-900'
+                    }`}
+                  />
+                </div>
+                <label className="flex items-center gap-2 cursor-pointer text-xs pt-0.5">
+                  <input
+                    type="checkbox"
+                    checked={useCorsFallback}
+                    onChange={(e) => setUseCorsFallback(e.target.checked)}
+                    className="rounded border-slate-600 text-indigo-600 focus:ring-indigo-500"
+                  />
+                  <span className={`flex items-center gap-1.5 ${isDark ? 'text-slate-400' : 'text-slate-600'}`}>
+                    <ShieldAlert className="w-3.5 h-3.5 text-indigo-400" />
+                    {t.corsFallbackLabel}
+                  </span>
+                </label>
+              </div>
+            ) : (
+              <div
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+                    setLocalFile(e.dataTransfer.files[0]);
+                  }
+                }}
+                onClick={() => fileInputRef.current?.click()}
+                className={`border-2 border-dashed rounded-2xl p-8 text-center cursor-pointer transition ${
+                  isDark
+                    ? 'border-slate-700 hover:border-indigo-500 bg-slate-950/50'
+                    : 'border-slate-300 hover:border-indigo-500 bg-slate-50'
+                }`}
+              >
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".safetensors,.gguf"
+                  className="hidden"
+                  onChange={(e) => {
+                    if (e.target.files && e.target.files[0]) {
+                      setLocalFile(e.target.files[0]);
+                    }
+                  }}
+                />
+                <Upload className="w-10 h-10 mx-auto mb-3 text-indigo-500" />
+                {localFile ? (
+                  <div>
+                    <p className="font-semibold text-sm text-indigo-400">{localFile.name}</p>
+                    <p className={`text-xs mt-1 ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+                      {t.fileSizeInfo((localFile.size / 1024 ** 3).toFixed(3))}
+                    </p>
+                  </div>
+                ) : (
+                  <div>
+                    <p className="font-medium text-sm">
+                      {t.dropPromptMain} <code className="text-indigo-400">.safetensors</code> / <code className="text-indigo-400">.gguf</code> {t.dropPromptSuffix}
+                    </p>
+                    <p className={`text-xs mt-1 ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+                      {t.dropPromptSub}
+                    </p>
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="mt-5 flex items-center justify-end">
+              <button
+                onClick={handleExtract}
+                disabled={loading}
+                className="w-full sm:w-auto px-6 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-semibold text-sm shadow-lg shadow-indigo-500/25 flex items-center justify-center gap-2 transition"
+              >
+                <Sparkles className="w-4 h-4" />
+                {loading ? t.extractBtnLoading : t.extractBtnIdle}
+              </button>
+            </div>
+          </div>
+
+          {/* KOLOM KANAN: PENGATURAN FORMAT JSON */}
+          <div className={`rounded-2xl border p-5 shadow-sm space-y-4 ${
+            isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'
+          }`}>
+            <h2 className="font-semibold flex items-center gap-2">
+              <Settings2 className="w-4 h-4 text-indigo-500" />
+              {t.settingsTitle}
+            </h2>
+
+            <div>
+              <label className={`block text-xs font-medium mb-1.5 ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>
+                {t.jsonModeLabel}
+              </label>
+              <select
+                value={jsonMode}
+                onChange={(e) => setJsonMode(e.target.value as JsonStructureMode)}
+                className={`w-full px-3 py-2 rounded-xl border text-xs font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500 ${
+                  isDark
+                    ? 'bg-slate-950 border-slate-800 text-slate-100'
+                    : 'bg-slate-50 border-slate-300 text-slate-900'
+                }`}
+              >
+                <option value="lengkap">{t.jsonModeFull}</option>
+                <option value="ringkas">{t.jsonModeCompact}</option>
+                <option value="minimal">{t.jsonModeMinimal}</option>
+              </select>
+            </div>
+
+            <label className="flex items-start gap-2.5 cursor-pointer text-xs">
+              <input
+                type="checkbox"
+                checked={separateQuant}
+                onChange={(e) => setSeparateQuant(e.target.checked)}
+                className="mt-0.5 rounded border-slate-600 text-indigo-600 focus:ring-indigo-500"
+              />
+              <span>
+                <strong>{t.separateQuantTitle}</strong>
+                <span className={`block ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+                  <code>.weight_scale</code>, <code>.comfy_quant</code>, etc. {t.separateQuantDesc}
+                </span>
+              </span>
+            </label>
+
+            <label className="flex items-start gap-2.5 cursor-pointer text-xs">
+              <input
+                type="checkbox"
+                checked={summarizeGguf}
+                onChange={(e) => setSummarizeGguf(e.target.checked)}
+                className="mt-0.5 rounded border-slate-600 text-indigo-600 focus:ring-indigo-500"
+              />
+              <span>
+                <strong>{t.summarizeGgufTitle}</strong>
+                <span className={`block ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+                  {t.summarizeGgufDesc}
+                </span>
+              </span>
+            </label>
+
+            {summarizeGguf && (
+              <div className="flex items-center justify-between text-xs pt-1">
+                <span className={isDark ? 'text-slate-400' : 'text-slate-600'}>{t.maxArrayItemsLabel}</span>
+                <input
+                  type="number"
+                  min={5}
+                  max={200}
+                  value={maxArrayItems}
+                  onChange={(e) => setMaxArrayItems(Number(e.target.value) || 20)}
+                  className={`w-20 px-2.5 py-1 rounded-lg border text-center font-mono ${
+                    isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                  }`}
+                />
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* PESAN ERROR */}
+        {errorMsg && (
+          <div className="rounded-2xl border border-red-500/40 bg-red-500/10 p-4 text-red-400 flex items-start gap-3 text-sm">
+            <AlertCircle className="w-5 h-5 shrink-0 mt-0.5" />
+            <div>
+              <p className="font-semibold">{t.errorTitle}</p>
+              <p className="text-xs mt-1 opacity-90">{errorMsg}</p>
+            </div>
+          </div>
+        )}
+
+        {/* HASIL EKSTRAKSI */}
+        {summary && (
+          <div className="space-y-6">
+            {/* KARTU METRIK UTAMA & TOMBOL AKSI JSON */}
+            <div className={`rounded-2xl border p-5 shadow-sm ${
+              isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'
+            }`}>
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-5 border-b border-slate-800/60">
+                <div>
+                  <div className="flex items-center gap-2.5 flex-wrap">
+                    <span className="px-2.5 py-1 rounded-lg text-xs font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+                      {summary.format}
+                    </span>
+                    <span className="px-2.5 py-1 rounded-lg text-xs font-medium bg-indigo-500/15 text-indigo-400">
+                      {summary.source_type}
+                    </span>
+                    <h2 className="text-lg font-bold font-mono break-all">{summary.file_name}</h2>
+                  </div>
+                  <p className={`text-xs mt-1.5 ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+                    {t.quotaReadPrefix} <strong className="text-emerald-400">{t.quotaReadOnly(summary.downloaded_kb.toLocaleString())}</strong> {t.quotaReadFrom(summary.file_size_gb, summary.file_size_mb.toLocaleString())}
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-2.5 shrink-0">
+                  <button
+                    onClick={handleCopyJson}
+                    className={`px-4 py-2.5 rounded-xl border text-xs font-semibold flex items-center gap-2 transition ${
+                      isDark
+                        ? 'bg-slate-800 border-slate-700 hover:bg-slate-700 text-slate-200'
+                        : 'bg-slate-100 border-slate-300 hover:bg-slate-200 text-slate-800'
+                    }`}
+                  >
+                    {copied ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
+                    {copied ? t.copiedBtn : t.copyBtn}
+                  </button>
+                  <button
+                    onClick={handleDownloadJson}
+                    className="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold shadow-lg shadow-emerald-600/25 flex items-center gap-2 transition"
+                  >
+                    <Download className="w-4 h-4" />
+                    {t.downloadBtn}
+                  </button>
+                </div>
+              </div>
+
+              {/* 4 KOTAK RINGKASAN */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 pt-5">
+                <div className={`p-3.5 rounded-xl border ${isDark ? 'bg-slate-950/60 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
+                  <span className={`text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>{t.statTotalParams}</span>
+                  <p className="text-xl font-bold mt-1 text-indigo-400 font-mono">{summary.total_parameters_billion} B</p>
+                  <span className="text-[11px] opacity-70 font-mono">{summary.total_parameters.toLocaleString()} params</span>
+                </div>
+                <div className={`p-3.5 rounded-xl border ${isDark ? 'bg-slate-950/60 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
+                  <span className={`text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>{t.statMainLayers}</span>
+                  <p className="text-xl font-bold mt-1 font-mono">{summary.total_layers.toLocaleString()}</p>
+                  <span className="text-[11px] opacity-70">{t.statMainLayersSub}</span>
+                </div>
+                <div className={`p-3.5 rounded-xl border ${isDark ? 'bg-slate-950/60 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
+                  <span className={`text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>{t.statQuantTensors}</span>
+                  <p className="text-xl font-bold mt-1 text-amber-400 font-mono">{summary.quantization_helper_tensors.toLocaleString()}</p>
+                  <span className="text-[11px] opacity-70">{t.statQuantTensorsSub}</span>
+                </div>
+                <div className={`p-3.5 rounded-xl border ${isDark ? 'bg-slate-950/60 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
+                  <span className={`text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>{t.statFileSize}</span>
+                  <p className="text-xl font-bold mt-1 text-emerald-400 font-mono">{summary.file_size_gb} GiB</p>
+                  <span className="text-[11px] opacity-70 font-mono">{summary.file_size_mb.toLocaleString()} MB</span>
+                </div>
+              </div>
+            </div>
+
+            {/* NAVIGASI TAB VIEW */}
+            <div className={`flex flex-wrap gap-2 border-b pb-3 ${isDark ? 'border-slate-800' : 'border-slate-200'}`}>
+              {[
+                { id: 'summary', label: t.viewTabSummary },
+                { id: 'visual', label: t.viewTabVisual },
+                { id: 'layers', label: t.viewTabLayers(mainTensors.length.toLocaleString()) },
+                { id: 'quant', label: t.viewTabQuant(quantTensors.length.toLocaleString()) },
+                { id: 'metadata', label: t.viewTabMeta(Object.keys(metadata).length) },
+                { id: 'json', label: t.viewTabJson },
+              ].map((tabItem) => (
+                <button
+                  key={tabItem.id}
+                  onClick={() => setActiveTab(tabItem.id as any)}
+                  className={`px-4 py-2 rounded-xl text-xs font-semibold transition ${
+                    activeTab === tabItem.id
+                      ? 'bg-indigo-600 text-white shadow-md shadow-indigo-500/20'
+                      : isDark
+                      ? 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
+                      : 'bg-white text-slate-600 hover:text-slate-900 border border-slate-200'
+                  }`}
+                >
+                  {tabItem.label}
+                </button>
+              ))}
+            </div>
+
+            {/* ISI TAB VISUALISASI (RECHARTS BAR CHART) */}
+            {activeTab === 'visual' && (
+              <div className={`rounded-2xl border p-5 space-y-4 ${isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+                <div>
+                  <h3 className="font-semibold text-sm flex items-center gap-2">
+                    <BarChart3 className="w-4 h-4 text-indigo-400" />
+                    {t.visualTitle}
+                  </h3>
+                  <p className={`text-xs mt-1 ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+                    {t.visualSubtitle}
+                  </p>
+                </div>
+
+                <div className="h-[420px] w-full pt-2">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart
+                      data={blockChartData}
+                      margin={{ top: 16, right: 24, left: 12, bottom: 70 }}
+                    >
+                      <CartesianGrid
+                        strokeDasharray="3 3"
+                        stroke={isDark ? '#1e293b' : '#e2e8f0'}
+                        vertical={false}
+                      />
+                      <XAxis
+                        dataKey="blockGroup"
+                        angle={-30}
+                        textAnchor="end"
+                        interval={0}
+                        height={80}
+                        tick={{
+                          fill: isDark ? '#94a3b8' : '#475569',
+                          fontSize: 11,
+                          fontFamily: 'monospace',
+                        }}
+                      />
+                      <YAxis
+                        tickFormatter={(val) => `${val.toLocaleString()} M`}
+                        tick={{
+                          fill: isDark ? '#94a3b8' : '#475569',
+                          fontSize: 11,
+                          fontFamily: 'monospace',
+                        }}
+                      />
+                      <Tooltip
+                        cursor={{ fill: isDark ? 'rgba(99, 102, 241, 0.1)' : 'rgba(99, 102, 241, 0.06)' }}
+                        contentStyle={{
+                          backgroundColor: isDark ? '#0f172a' : '#ffffff',
+                          borderColor: isDark ? '#1e293b' : '#e2e8f0',
+                          borderRadius: '0.75rem',
+                          color: isDark ? '#f1f5f9' : '#0f172a',
+                          fontSize: '12px',
+                          fontFamily: 'monospace',
+                        }}
+                        formatter={(value: any, _name: any, props: any) => [
+                          `${Number(value).toLocaleString()} M (${props.payload.parameters.toLocaleString()} params | ${props.payload.total_tensors.toLocaleString()} tensor)`,
+                          t.colParamsM,
+                        ]}
+                      />
+                      <Bar dataKey="parameters_M" radius={[6, 6, 0, 0]}>
+                        {blockChartData.map((entry, index) => (
+                          <Cell key={entry.blockGroup} fill={BAR_COLORS[index % BAR_COLORS.length]} />
+                        ))}
+                      </Bar>
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            )}
+
+            {/* ISI TAB 1: RINGKASAN PRESISI & BLOK ARSITEKTUR */}
+            {activeTab === 'summary' && (
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                {/* Distribusi Presisi */}
+                <div className={`rounded-2xl border p-5 ${isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+                  <h3 className="font-semibold text-sm mb-4 flex items-center gap-2">
+                    <SlidersHorizontal className="w-4 h-4 text-indigo-400" />
+                    {t.precDistTitle}
+                  </h3>
+                  <div className="space-y-3">
+                    {Object.entries(summary.precision_distribution).map(([prec, info]) => (
+                      <div key={prec} className={`p-3 rounded-xl border ${isDark ? 'bg-slate-950/60 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
+                        <div className="flex items-center justify-between text-xs font-semibold mb-1.5">
+                          <span className="px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-400 font-mono">{prec}</span>
+                          <span className="font-mono">{info.tensor_count.toLocaleString()} tensor ({info.percentage_tensors}%)</span>
+                        </div>
+                        <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
+                          <div
+                            className="h-full bg-indigo-500 rounded-full"
+                            style={{ width: `${Math.max(3, info.percentage_tensors)}%` }}
+                          />
+                        </div>
+                        <p className="text-[11px] opacity-70 mt-1.5 font-mono">
+                          {(info.parameters / 1e6).toLocaleString(undefined, { maximumFractionDigits: 2 })} {t.millionParams}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Kelompok Blok Arsitektur */}
+                <div className={`lg:col-span-2 rounded-2xl border p-5 ${isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+                  <h3 className="font-semibold text-sm mb-4 flex items-center gap-2">
+                    <Layers className="w-4 h-4 text-indigo-400" />
+                    {t.archBlockTitle}
+                  </h3>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left border-collapse text-xs">
+                      <thead>
+                        <tr className={`border-b ${isDark ? 'border-slate-800 text-slate-400' : 'border-slate-200 text-slate-500'}`}>
+                          <th className="py-2.5 px-3">{t.colBlockGroup}</th>
+                          <th className="py-2.5 px-3 text-right">{t.colBlockCount}</th>
+                          <th className="py-2.5 px-3 text-right">{t.colTotalTensors}</th>
+                          <th className="py-2.5 px-3 text-right">{t.colParamsM}</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/40 font-mono">
+                        {Object.entries(summary.architecture_block_summary).map(([grp, gInfo]) => (
+                          <tr key={grp} className={isDark ? 'hover:bg-slate-800/40' : 'hover:bg-slate-100'}>
+                            <td className="py-2.5 px-3 font-semibold text-indigo-400">{grp}</td>
+                            <td className="py-2.5 px-3 text-right">
+                              {gInfo.total_blocks ? (
+                                <span className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-400">
+                                  {gInfo.total_blocks} {t.blockUnit}
+                                </span>
+                              ) : (
+                                '-'
+                              )}
+                            </td>
+                            <td className="py-2.5 px-3 text-right">{gInfo.total_tensors.toLocaleString()}</td>
+                            <td className="py-2.5 px-3 text-right">{gInfo.parameters_M.toLocaleString()} M</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* ISI TAB 2: DAFTAR LAYER UTAMA + FILTER CANGGIH */}
+            {activeTab === 'layers' && (
+              <div className={`rounded-2xl border p-5 space-y-4 ${isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+                {/* Bar Filter Canggih */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+                  <div className="lg:col-span-2 relative">
+                    <Search className="w-4 h-4 absolute left-3.5 top-3 text-slate-400" />
+                    <input
+                      type="text"
+                      value={searchQuery}
+                      onChange={(e) => {
+                        setSearchQuery(e.target.value);
+                        setCurrentPage(1);
+                      }}
+                      placeholder={useRegex ? t.searchPlaceholderRegex : t.searchPlaceholderText}
+                      className={`w-full pl-9 pr-20 py-2 rounded-xl border text-xs font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500 ${
+                        isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                      }`}
+                    />
+                    <button
+                      onClick={() => setUseRegex(!useRegex)}
+                      className={`absolute right-2 top-1.5 px-2 py-1 rounded-lg text-[10px] font-bold transition ${
+                        useRegex
+                          ? 'bg-indigo-600 text-white'
+                          : isDark ? 'bg-slate-800 text-slate-400' : 'bg-slate-200 text-slate-600'
+                      }`}
+                      title={t.regexTooltip}
+                    >
+                      .* Regex
+                    </button>
+                  </div>
+
+                  <select
+                    value={selectedPrecision}
+                    onChange={(e) => {
+                      setSelectedPrecision(e.target.value);
+                      setCurrentPage(1);
+                    }}
+                    className={`px-3 py-2 rounded-xl border text-xs ${
+                      isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                    }`}
+                  >
+                    <option value="ALL">{t.allPrecisions}</option>
+                    {Object.keys(summary.precision_distribution).map((p) => (
+                      <option key={p} value={p}>
+                        {t.precisionPrefix}: {p} ({summary.precision_distribution[p].tensor_count})
+                      </option>
+                    ))}
+                  </select>
+
+                  <select
+                    value={selectedBlockGroup}
+                    onChange={(e) => {
+                      setSelectedBlockGroup(e.target.value);
+                      setCurrentPage(1);
+                    }}
+                    className={`px-3 py-2 rounded-xl border text-xs ${
+                      isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                    }`}
+                  >
+                    <option value="ALL">{t.allBlockGroups}</option>
+                    {uniqueBlockGroups.map((g) => (
+                      <option key={g} value={g}>{t.blockPrefix}: {g}</option>
+                    ))}
+                  </select>
+
+                  <select
+                    value={sortBy}
+                    onChange={(e) => setSortBy(e.target.value as any)}
+                    className={`px-3 py-2 rounded-xl border text-xs ${
+                      isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                    }`}
+                  >
+                    <option value="default">{t.sortDefault}</option>
+                    <option value="name">{t.sortName}</option>
+                    <option value="params_desc">{t.sortParamsDesc}</option>
+                    <option value="params_asc">{t.sortParamsAsc}</option>
+                  </select>
+                </div>
+
+                {/* Info Jumlah Filter & Pagination Atas */}
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                  <span className={isDark ? 'text-slate-400' : 'text-slate-600'}>
+                    {t.showingCount(filteredLayers.length.toLocaleString(), mainTensors.length.toLocaleString())}
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <span>{t.rowsPerPageLabel}</span>
+                    <select
+                      value={rowsPerPage}
+                      onChange={(e) => {
+                        setRowsPerPage(Number(e.target.value));
+                        setCurrentPage(1);
+                      }}
+                      className={`px-2 py-1 rounded-lg border ${
+                        isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                      }`}
+                    >
+                      {[25, 50, 100, 250].map((n) => (
+                        <option key={n} value={n}>{n}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                {/* Tabel Layer */}
+                <div className="overflow-x-auto rounded-xl border border-slate-800/60">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead>
+                      <tr className={isDark ? 'bg-slate-950 text-slate-400' : 'bg-slate-100 text-slate-600'}>
+                        <th className="py-3 px-3 w-14">{t.colNo}</th>
+                        <th className="py-3 px-3">{t.colLayerName}</th>
+                        <th className="py-3 px-3">{t.colShape}</th>
+                        <th className="py-3 px-3">{t.colPrecision}</th>
+                        <th className="py-3 px-3 text-right">{t.colParameters}</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800/40 font-mono">
+                      {paginatedLayers.map((layerItem, idx) => (
+                        <tr key={layerItem.name} className={isDark ? 'hover:bg-slate-800/40' : 'hover:bg-slate-50'}>
+                          <td className="py-2.5 px-3 opacity-60">
+                            {(currentPage - 1) * rowsPerPage + idx + 1}
+                          </td>
+                          <td className="py-2.5 px-3 break-all font-medium">{layerItem.name}</td>
+                          <td className="py-2.5 px-3 text-emerald-400">[{layerItem.shape.join(', ')}]</td>
+                          <td className="py-2.5 px-3">
+                            <span className="px-2 py-0.5 rounded bg-indigo-500/15 text-indigo-400">
+                              {layerItem.precision}
+                            </span>
+                          </td>
+                          <td className="py-2.5 px-3 text-right">{layerItem.parameters.toLocaleString()}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                {/* Navigasi Halaman */}
+                <div className="flex items-center justify-between pt-2 text-xs">
+                  <span>
+                    {t.pageInfo(currentPage, totalPages)}
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <button
+                      disabled={currentPage <= 1}
+                      onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                      className={`p-2 rounded-lg border disabled:opacity-40 ${
+                        isDark ? 'border-slate-800 hover:bg-slate-800' : 'border-slate-300 hover:bg-slate-100'
+                      }`}
+                    >
+                      <ChevronLeft className="w-4 h-4" />
+                    </button>
+                    <button
+                      disabled={currentPage >= totalPages}
+                      onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                      className={`p-2 rounded-lg border disabled:opacity-40 ${
+                        isDark ? 'border-slate-800 hover:bg-slate-800' : 'border-slate-300 hover:bg-slate-100'
+                      }`}
+                    >
+                      <ChevronRight className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* ISI TAB 3: TENSOR KUANTISASI */}
+            {activeTab === 'quant' && (
+              <div className={`rounded-2xl border p-5 ${isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+                {quantTensors.length === 0 ? (
+                  <p className="text-center py-8 text-sm opacity-70">
+                    {t.emptyQuantMsg}
+                  </p>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left border-collapse text-xs font-mono">
+                      <thead>
+                        <tr className={`border-b ${isDark ? 'border-slate-800 text-slate-400' : 'border-slate-200 text-slate-600'}`}>
+                          <th className="py-2.5 px-3">{t.colNo}</th>
+                          <th className="py-2.5 px-3">{t.colQuantName}</th>
+                          <th className="py-2.5 px-3">{t.colShape}</th>
+                          <th className="py-2.5 px-3">{t.colPrecision}</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/40">
+                        {quantTensors.slice(0, 300).map((qItem, i) => (
+                          <tr key={qItem.name}>
+                            <td className="py-2 px-3 opacity-60">{i + 1}</td>
+                            <td className="py-2 px-3 text-amber-400 break-all">{qItem.name}</td>
+                            <td className="py-2 px-3">[{qItem.shape.join(', ')}]</td>
+                            <td className="py-2 px-3">{qItem.precision}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* ISI TAB 4: METADATA */}
+            {activeTab === 'metadata' && (
+              <div className={`rounded-2xl border p-5 space-y-4 ${isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+                <input
+                  type="text"
+                  value={metaSearch}
+                  onChange={(e) => setMetaSearch(e.target.value)}
+                  placeholder={t.metaSearchPlaceholder}
+                  className={`w-full sm:w-80 px-3.5 py-2 rounded-xl border text-xs font-mono ${
+                    isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'
+                  }`}
+                />
+                {Object.keys(metadata).length === 0 ? (
+                  <p className="text-sm opacity-70 py-6 text-center">{t.emptyMetaMsg}</p>
+                ) : (
+                  <div className="space-y-2.5 max-h-[540px] overflow-y-auto pr-1">
+                    {Object.entries(metadata)
+                      .filter(([k]) => !metaSearch || k.toLowerCase().includes(metaSearch.toLowerCase()))
+                      .map(([k, v]) => (
+                        <div
+                          key={k}
+                          className={`p-3 rounded-xl border text-xs font-mono ${
+                            isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-200'
+                          }`}
+                        >
+                          <div className="font-bold text-indigo-400 mb-1">{k}</div>
+                          <pre className="whitespace-pre-wrap break-all opacity-90 text-[11px]">
+                            {typeof v === 'object' ? JSON.stringify(v, null, 2) : String(v)}
+                          </pre>
+                        </div>
+                      ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* ISI TAB 5: PREVIEW RAW JSON */}
+            {activeTab === 'json' && (
+              <div className={`rounded-2xl border p-5 ${isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+                <div className="flex items-center justify-between mb-3">
+                  <span className="text-xs font-semibold flex items-center gap-2">
+                    <FileJson className="w-4 h-4 text-indigo-400" />
+                    {t.jsonPreviewHeader}
+                  </span>
+                </div>
+                <pre className={`p-4 rounded-xl border text-xs font-mono overflow-x-auto max-h-[520px] ${
+                  isDark ? 'bg-slate-950 border-slate-800 text-emerald-400' : 'bg-slate-900 text-emerald-300'
+                }`}>
+                  {JSON.stringify(generatedJsonPayload, null, 2).split('\n').slice(0, 200).join('\n') +
+                    '\n\n' + t.jsonPreviewFooter}
+                </pre>
+              </div>
+            )}
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}

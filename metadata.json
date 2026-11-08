@@ -1,0 +1,6 @@
+{
+  "name": "Model Inspector & Layer Extractor (Safetensors & GGUF)",
+  "description": "Ekstrak daftar layer, ukuran shape, presisi, & metadata model Safetensors dan GGUF ke JSON tanpa mengunduh seluruh file model.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
